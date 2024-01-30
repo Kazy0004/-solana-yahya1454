@@ -29,6 +29,7 @@ use {
     crossbeam_channel::{bounded, Receiver, Sender, TrySendError},
     dashmap::DashSet,
     log::*,
+    rand::Rng,
     rayon::{
         iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
         ThreadPool,
@@ -1803,7 +1804,7 @@ impl Blockstore {
         };
 
         // Parent for slot meta should have been set by this point
-        assert!(!is_orphan(slot_meta));
+        assert!(!slot_meta.is_orphan());
 
         let new_consumed = if slot_meta.consumed == index {
             let mut current_index = index + 1;
@@ -1956,6 +1957,7 @@ impl Blockstore {
         let mut all_shreds = vec![];
         let mut slot_entries = vec![];
         let reed_solomon_cache = ReedSolomonCache::default();
+        let mut chained_merkle_root = Some(Hash::new_from_array(rand::thread_rng().gen()));
         // Find all the entries for start_slot
         for entry in entries.into_iter() {
             if remaining_ticks_in_slot == 0 {
@@ -1973,7 +1975,8 @@ impl Blockstore {
                 let (mut data_shreds, mut coding_shreds) = shredder.entries_to_shreds(
                     keypair,
                     &current_entries,
-                    true,        // is_last_in_slot
+                    true, // is_last_in_slot
+                    chained_merkle_root,
                     start_index, // next_shred_index
                     start_index, // next_code_index
                     true,        // merkle_variant
@@ -1982,6 +1985,7 @@ impl Blockstore {
                 );
                 all_shreds.append(&mut data_shreds);
                 all_shreds.append(&mut coding_shreds);
+                chained_merkle_root = Some(coding_shreds.last().unwrap().merkle_root().unwrap());
                 shredder = Shredder::new(
                     current_slot,
                     parent_slot,
@@ -2002,6 +2006,7 @@ impl Blockstore {
                 keypair,
                 &slot_entries,
                 is_full_slot,
+                chained_merkle_root,
                 0,    // next_shred_index
                 0,    // next_code_index
                 true, // merkle_variant
@@ -3822,7 +3827,8 @@ impl Blockstore {
         let meta_backup = &slot_meta_entry.old_slot_meta;
         {
             let mut meta_mut = meta.borrow_mut();
-            let was_orphan_slot = meta_backup.is_some() && is_orphan(meta_backup.as_ref().unwrap());
+            let was_orphan_slot =
+                meta_backup.is_some() && meta_backup.as_ref().unwrap().is_orphan();
 
             // If:
             // 1) This is a new slot
@@ -3848,7 +3854,7 @@ impl Blockstore {
 
                     // If the parent of `slot` is a newly inserted orphan, insert it into the orphans
                     // column family
-                    if is_orphan(&RefCell::borrow(&*prev_slot_meta)) {
+                    if RefCell::borrow(&*prev_slot_meta).is_orphan() {
                         write_batch.put::<cf::Orphans>(prev_slot, &true)?;
                     }
                 }
@@ -3956,7 +3962,7 @@ impl Blockstore {
                 // during the chaining process, see the function find_slot_meta_in_cached_state()
                 // for details. Slots that are orphans are missing a parent_slot, so we should
                 // fill in the parent now that we know it.
-                if is_orphan(&meta) {
+                if meta.is_orphan() {
                     meta.parent_slot = Some(parent_slot);
                 }
 
@@ -4216,12 +4222,6 @@ fn find_slot_meta_in_cached_state<'a>(
     }
 }
 
-fn is_orphan(meta: &SlotMeta) -> bool {
-    // If we have no parent, then this is the head of a detached chain of
-    // slots
-    meta.parent_slot.is_none()
-}
-
 // 1) Chain current_slot to the previous slot defined by prev_slot_meta
 fn chain_new_slot_to_prev_slot(
     prev_slot_meta: &mut SlotMeta,
@@ -4290,6 +4290,8 @@ pub fn create_new_ledger(
         &Keypair::new(),
         &entries,
         true, // is_last_in_slot
+        // chained_merkle_root
+        Some(Hash::new_from_array(rand::thread_rng().gen())),
         0,    // next_shred_index
         0,    // next_code_index
         true, // merkle_variant
@@ -4551,6 +4553,8 @@ pub fn entries_to_test_shreds(
             &Keypair::new(),
             entries,
             is_full_slot,
+            // chained_merkle_root
+            Some(Hash::new_from_array(rand::thread_rng().gen())),
             0, // next_shred_index,
             0, // next_code_index
             merkle_variant,
@@ -4811,6 +4815,7 @@ pub mod tests {
             InnerInstruction, InnerInstructions, Reward, Rewards, TransactionTokenBalance,
         },
         std::{cmp::Ordering, thread::Builder, time::Duration},
+        test_case::test_case,
     };
 
     // used for tests only
@@ -6324,7 +6329,7 @@ pub mod tests {
             .meta(1)
             .expect("Expect database get to succeed")
             .unwrap();
-        assert!(is_orphan(&meta));
+        assert!(meta.is_orphan());
         assert_eq!(
             blockstore.orphans_iterator(0).unwrap().collect::<Vec<_>>(),
             vec![1]
@@ -6340,12 +6345,12 @@ pub mod tests {
             .meta(1)
             .expect("Expect database get to succeed")
             .unwrap();
-        assert!(!is_orphan(&meta));
+        assert!(!meta.is_orphan());
         let meta = blockstore
             .meta(0)
             .expect("Expect database get to succeed")
             .unwrap();
-        assert!(is_orphan(&meta));
+        assert!(meta.is_orphan());
         assert_eq!(
             blockstore.orphans_iterator(0).unwrap().collect::<Vec<_>>(),
             vec![0]
@@ -6369,7 +6374,7 @@ pub mod tests {
                 .meta(i)
                 .expect("Expect database get to succeed")
                 .unwrap();
-            assert!(!is_orphan(&meta));
+            assert!(!meta.is_orphan());
         }
         // Orphans cf is empty
         assert!(blockstore.orphans_cf.is_empty().unwrap());
@@ -7439,7 +7444,7 @@ pub mod tests {
     #[test]
     fn test_insert_multiple_is_last() {
         solana_logger::setup();
-        let (shreds, _) = make_slot_entries(0, 0, 20, /*merkle_variant:*/ true);
+        let (shreds, _) = make_slot_entries(0, 0, 19, /*merkle_variant:*/ true);
         let num_shreds = shreds.len() as u64;
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
@@ -7453,6 +7458,7 @@ pub mod tests {
         assert!(slot_meta.is_full());
 
         let (shreds, _) = make_slot_entries(0, 0, 22, /*merkle_variant:*/ true);
+        assert!(shreds.len() > num_shreds as usize);
         blockstore.insert_shreds(shreds, None, false).unwrap();
         let slot_meta = blockstore.meta(0).unwrap().unwrap();
 
@@ -9868,7 +9874,9 @@ pub mod tests {
         let (data_shreds, coding_shreds) = shredder.entries_to_shreds(
             &leader_keypair,
             &entries,
-            true,          // is_last_in_slot
+            true, // is_last_in_slot
+            // chained_merkle_root
+            Some(Hash::new_from_array(rand::thread_rng().gen())),
             fec_set_index, // next_shred_index
             fec_set_index, // next_code_index
             true,          // merkle_variant
@@ -9921,18 +9929,21 @@ pub mod tests {
         assert_eq!(num_coding_in_index, num_coding);
     }
 
-    #[test]
-    fn test_duplicate_slot() {
+    #[test_case(false)]
+    #[test_case(true)]
+    fn test_duplicate_slot(chained: bool) {
         let slot = 0;
         let entries1 = make_slot_entries_with_transactions(1);
         let entries2 = make_slot_entries_with_transactions(1);
         let leader_keypair = Arc::new(Keypair::new());
         let reed_solomon_cache = ReedSolomonCache::default();
         let shredder = Shredder::new(slot, 0, 0, 0).unwrap();
+        let chained_merkle_root = chained.then(|| Hash::new_from_array(rand::thread_rng().gen()));
         let (shreds, _) = shredder.entries_to_shreds(
             &leader_keypair,
             &entries1,
             true, // is_last_in_slot
+            chained_merkle_root,
             0,    // next_shred_index
             0,    // next_code_index,
             true, // merkle_variant
@@ -9943,6 +9954,7 @@ pub mod tests {
             &leader_keypair,
             &entries2,
             true, // is_last_in_slot
+            chained_merkle_root,
             0,    // next_shred_index
             0,    // next_code_index
             true, // merkle_variant
@@ -10328,7 +10340,11 @@ pub mod tests {
         let num_unique_entries = max_ticks_per_n_shreds(1, None) + 1;
         let (mut original_shreds, original_entries) =
             make_slot_entries(0, 0, num_unique_entries, /*merkle_variant:*/ true);
-
+        let mut duplicate_shreds = original_shreds.clone();
+        // Mutate signature so that payloads are not the same as the originals.
+        for shred in &mut duplicate_shreds {
+            shred.sign(&Keypair::new());
+        }
         // Discard first shred, so that the slot is not full
         assert!(original_shreds.len() > 1);
         let last_index = original_shreds.last().unwrap().index() as u64;
@@ -10350,14 +10366,6 @@ pub mod tests {
             assert!(!blockstore.is_full(0));
         }
 
-        let duplicate_shreds = entries_to_test_shreds(
-            &original_entries,
-            0,    // slot
-            0,    // parent_slot
-            true, // is_full_slot
-            0,    // version
-            true, // merkle_variant
-        );
         let num_shreds = duplicate_shreds.len() as u64;
         blockstore
             .insert_shreds(duplicate_shreds, None, false)

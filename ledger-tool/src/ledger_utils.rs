@@ -3,14 +3,15 @@ use {
     clap::{value_t, value_t_or_exit, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,
-    solana_accounts_db::hardened_unpack::open_genesis_config,
+    solana_accounts_db::{
+        hardened_unpack::open_genesis_config, utils::create_all_accounts_run_and_snapshot_dirs,
+    },
     solana_core::{
         accounts_hash_verifier::AccountsHashVerifier, validator::BlockVerificationMethod,
     },
     solana_geyser_plugin_manager::geyser_plugin_service::{
         GeyserPluginService, GeyserPluginServiceError,
     },
-    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_ledger::{
         bank_forks_utils::{self, BankForksUtilsError},
         blockstore::{Blockstore, BlockstoreError},
@@ -35,15 +36,13 @@ use {
         snapshot_config::SnapshotConfig,
         snapshot_hash::StartingSnapshotHashes,
         snapshot_utils::{
-            self, clean_orphaned_account_snapshot_dirs, create_all_accounts_run_and_snapshot_dirs,
-            move_and_async_delete_path_contents, SnapshotError,
+            self, clean_orphaned_account_snapshot_dirs, move_and_async_delete_path_contents,
         },
     },
     solana_sdk::{
-        clock::Slot, genesis_config::GenesisConfig, pubkey::Pubkey, signature::Signer,
-        signer::keypair::Keypair, timing::timestamp, transaction::VersionedTransaction,
+        clock::Slot, genesis_config::GenesisConfig, pubkey::Pubkey,
+        transaction::VersionedTransaction,
     },
-    solana_streamer::socket::SocketAddrSpace,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         path::{Path, PathBuf},
@@ -65,10 +64,10 @@ const PROCESS_SLOTS_HELP_STRING: &str =
 #[derive(Error, Debug)]
 pub(crate) enum LoadAndProcessLedgerError {
     #[error("failed to clean orphaned account snapshot directories: {0}")]
-    CleanOrphanedAccountSnapshotDirectories(#[source] SnapshotError),
+    CleanOrphanedAccountSnapshotDirectories(#[source] std::io::Error),
 
     #[error("failed to create all run and snapshot directories: {0}")]
-    CreateAllAccountsRunAndSnapshotDirectories(#[source] SnapshotError),
+    CreateAllAccountsRunAndSnapshotDirectories(#[source] std::io::Error),
 
     #[error("custom accounts path is not supported with seconday blockstore access")]
     CustomAccountsPathUnsupported(#[source] BlockstoreError),
@@ -314,20 +313,12 @@ pub fn load_and_process_ledger(
         }
     }
 
-    let node_id = Arc::new(Keypair::new());
-    let cluster_info = Arc::new(ClusterInfo::new(
-        ContactInfo::new_localhost(&node_id.pubkey(), timestamp()),
-        Arc::clone(&node_id),
-        SocketAddrSpace::Unspecified,
-    ));
     let (accounts_package_sender, accounts_package_receiver) = crossbeam_channel::unbounded();
     let accounts_hash_verifier = AccountsHashVerifier::new(
         accounts_package_sender.clone(),
         accounts_package_receiver,
         None,
         exit.clone(),
-        cluster_info,
-        None,
         SnapshotConfig::new_load_only(),
     );
     let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();

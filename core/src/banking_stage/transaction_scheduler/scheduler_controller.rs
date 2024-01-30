@@ -18,6 +18,7 @@ use {
     },
     crossbeam_channel::RecvTimeoutError,
     solana_accounts_db::transaction_error_metrics::TransactionErrorMetrics,
+    solana_cost_model::cost_model::CostModel,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk::{
@@ -167,7 +168,7 @@ impl SchedulerController {
         let fee_check_results: Vec<_> = check_results
             .into_iter()
             .zip(transactions)
-            .map(|((result, _nonce), tx)| {
+            .map(|((result, _nonce, _lamports), tx)| {
                 result?; // if there's already error do nothing
                 Consumer::check_fee_payer_unlocked(bank, tx.message(), &mut error_counters)
             })
@@ -225,7 +226,7 @@ impl SchedulerController {
                 &mut error_counters,
             );
 
-            for ((result, _nonce), id) in check_results.into_iter().zip(chunk.iter()) {
+            for ((result, _nonce, _lamports), id) in check_results.into_iter().zip(chunk.iter()) {
                 if result.is_err() {
                     saturating_add_assign!(self.count_metrics.num_dropped_on_age_and_status, 1);
                     self.container.remove_by_id(&id.id);
@@ -342,6 +343,8 @@ impl SchedulerController {
             {
                 saturating_add_assign!(post_transaction_check_count, 1);
                 let transaction_id = self.transaction_id_generator.next();
+
+                let transaction_cost = CostModel::calculate_cost(&transaction, &bank.feature_set);
                 let transaction_ttl = SanitizedTransactionTTL {
                     transaction,
                     max_age_slot: last_slot_in_epoch,
@@ -351,6 +354,7 @@ impl SchedulerController {
                     transaction_id,
                     transaction_ttl,
                     priority_details,
+                    transaction_cost,
                 ) {
                     saturating_add_assign!(self.count_metrics.num_dropped_on_capacity, 1);
                 }
